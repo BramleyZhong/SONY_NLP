@@ -1,0 +1,24 @@
+1. BART model is a large language model that can do many NLP jobs such as text generation
+
+2. BART model needs GPU to train. If going to cloud, still need GPU/TPU on cloud
+
+3. Training is time-consuming (30 mins on my own laptop) and requires large memory
+
+4. Currently, val accuaracy can reach 91.4% and test data accuracy can reach 87.0%. 
+   But on average, val accuracy should be around 90% and test accuracy should be around 85%
+
+5. Further ways to improve accuracy: a) provide more labeled training data 
+   b) clean training data/improve training data quality c) parameters tuning
+
+6. Thai words issue, current approach is to remove the lines with Thai characters in it. Considering a) remove lines if to majority of model names are Thai b) delete Thai chracters if just a few
+
+7. Model gives a framework to predict KATABAN name. For future jobs such as predicting using the promoters' data, 
+   can provide new training data (promoters' data) to train a new model to predict on promoters' data
+
+8. Can retrain the model if a) after a long time, a lot of new data coming in (bringing new pattern that the model has not learned) 
+   b) drastic model perforamnce drop is observed   
+
+9. Compatibility on Dataiku: Dataiku has the recipe to run python code, but we are not sure 
+   a) whether Dataiku can provide the environment (specific python version, library, packages etc.) for the code to run 
+   b) how Dataiku execute the computation at the backend (affect the efficiency significantly)
+
