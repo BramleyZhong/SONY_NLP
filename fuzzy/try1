@@ -1,0 +1,160 @@
+# -*- coding: utf-8 -*-
+import dataiku
+import pandas as pd, numpy as np
+from dataiku import pandasutils as pdu
+
+def calcMktShare(row, df):
+    total_m = sum(df.loc[(df["year"] == row["year"])&(df["month"] == row["month"]),"base_forecast"])
+
+    return row["base_forecast"]/total_m
+
+def calcLastSeasonality(row, lastSeasonality_df):
+    last_seasonality = lastSeasonality_df.loc[(lastSeasonality_df["month"] == row["month"])
+                                                      &(lastSeasonality_df["ctry_inch"] == row["ctry_inch"]),"GFK Monthly Sell Out Qty_sum_seasonal"]
+    last_residuals = lastSeasonality_df.loc[(lastSeasonality_df["month"] == row["month"])
+                                                  &(lastSeasonality_df["ctry_inch"] == row["ctry_inch"]),"GFK Monthly Sell Out Qty_sum_residuals"]
+    last_trend = lastSeasonality_df.loc[(lastSeasonality_df["month"] == row["month"])
+                                                  &(lastSeasonality_df["ctry_inch"] == row["ctry_inch"]),"GFK Monthly Sell Out Qty_sum_trend"]
+
+    if(last_seasonality.empty):
+        return 0
+
+    res = float((last_seasonality + last_residuals)/last_trend)    
+    return res
+
+# Read recipe inputs
+Segment_Monthly_LastSeasonality = dataiku.Dataset("Segment_monitor_LastSeasonality")
+lastSeasonality_df = Segment_Monthly_LastSeasonality.get_dataframe()
+Segment_Trend_Eval = dataiku.Dataset("Segment_Trend_Eval")
+Trend_Eval_df = Segment_Trend_Eval.get_dataframe()
+
+Mkt_Eval = dataiku.Dataset("Mkt_MonthlyData_Yearly-Eval")
+Mkt_Eval_df = Mkt_Eval.get_dataframe()
+Mkt_TotalMetrics = dataiku.Dataset("Mkt_MonthlyData_Yearly-Metrics")
+Mkt_TotalMetrics_df = Mkt_TotalMetrics.get_dataframe()
+
+
+# Compute recipe outputs
+Eval_df = Trend_Eval_df.copy()
+
+Eval_df["trend_forecast"] = Eval_df.apply( # trend = 0 for trend < 0
+        lambda row: row["forecast"] if (row["forecast"] > 0) else 0
+    , axis=1)
+
+# Percentage of difference / year-to-year trend
+last_eval_month = dataiku.get_custom_variables()["g_last_eval_month"]
+s_month = int(last_eval_month) if len(last_eval_month)<3 else int(last_eval_month[0:len(last_eval_month)-2])
+
+Eval_df["p_diff_Y-1-2"] = 0
+
+Eval_df["p_diff_Y-1-3"] = 0
+
+
+# Calculate seasonality:
+Eval_df["seasonality_calc"] = Eval_df.apply(
+        lambda row: float(calcLastSeasonality(row, lastSeasonality_df))*float(Eval_df.loc[(Eval_df["month"] == row["month"])
+                                    &(Eval_df["ctry_inch"] == row["ctry_inch"]), "trend_forecast"])
+    , axis=1)
+
+# Calculate Fct
+Eval_df["base_forecast"] = Eval_df["trend_forecast"] + Eval_df["seasonality_calc"]
+Eval_df["base_forecast"] = Eval_df.apply(
+        lambda row: row["base_forecast"] if (row["base_forecast"] > 0) else 0
+    , axis=1)
+Eval_df["forecast"] = Eval_df["base_forecast"]
+
+# Calculate % to total mkt by subcategory
+Eval_df["segment_mktShare"] = Eval_df.apply(
+        lambda row: calcMktShare(row, Eval_df)
+    , axis=1)
+
+
+# Calculate Metrics:
+wmape_totalMkt = float(Mkt_TotalMetrics_df["wmape"].head(1))
+
+cy_in = Eval_df["ctry_inch"].unique()
+
+mape = ((Eval_df["GFK Monthly Sell Out Qty_sum"] - Eval_df["base_forecast"]).abs() / Eval_df["GFK Monthly Sell Out Qty_sum"]).mean()
+
+wmape_total_Sgm = sum(abs(Eval_df["GFK Monthly Sell Out Qty_sum"] - Eval_df['base_forecast'])) / sum(abs(Eval_df["GFK Monthly Sell Out Qty_sum"]))
+
+# Total value
+Metrics_df = pd.DataFrame({"ctry_inch":['TOTAL'],
+                           "mape":[mape],
+                           "wmape":[wmape_total_Sgm]})
+
+# By Sub-Category
+for c_i in cy_in:
+    t_df = Eval_df.loc[Eval_df["ctry_inch"] == c_i].copy()
+
+    wmape = sum(abs(t_df["GFK Monthly Sell Out Qty_sum"] - t_df["base_forecast"])) / sum(abs(t_df["GFK Monthly Sell Out Qty_sum"]))
+
+    mape = ((t_df["GFK Monthly Sell Out Qty_sum"] - t_df["base_forecast"]).abs() / t_df["GFK Monthly Sell Out Qty_sum"]).mean()
+
+    Metrics_df = Metrics_df.append(pd.DataFrame({"ctry_inch":[c_i],
+                                                 "mape":[mape],
+                                                 "wmape":[wmape]}), ignore_index=True)
+
+# Adjust if necessary:
+for c_i in cy_in:
+    sc_wmape = float(Metrics_df.loc[Metrics_df["ctry_inch"] == c_i, "wmape"])
+
+    if(sc_wmape > wmape_totalMkt): # Adjust only if WMAPE is worse than total Market fct:
+        sum_MktFct = sum(Mkt_Eval_df["forecast"])
+        sum_SgFct = sum(Eval_df["base_forecast"])
+        ok_fct_lst = Metrics_df.loc[Metrics_df["wmape"] < wmape_totalMkt, "ctry_inch"]
+        sum_OkFct = sum(Eval_df.loc[Eval_df["ctry_inch"].isin(ok_fct_lst), "base_forecast"])
+        Eval_df["forecast"] = Eval_df.apply(
+            lambda row: row["base_forecast"] * sum_MktFct * (1-(sum_OkFct/sum_SgFct)) / (sum_SgFct - sum_OkFct) if
+                        (sum_SgFct > 0) else 0
+        , axis=1)
+
+    else:
+        Eval_df["forecast"] = Eval_df["base_forecast"]
+
+# Total value adjusted
+mape = ((Eval_df["GFK Monthly Sell Out Qty_sum"] - Eval_df["forecast"]).abs() / Eval_df["GFK Monthly Sell Out Qty_sum"]).mean()
+wmape = sum(abs(Eval_df["GFK Monthly Sell Out Qty_sum"] - Eval_df['forecast'])) / sum(abs(Eval_df["GFK Monthly Sell Out Qty_sum"]))
+
+GFK_Monthly_Sell_Out_Qty_sum_r = sum(Eval_df["GFK Monthly Sell Out Qty_sum"])
+GFK_Monthly_Sell_Out_Qty_sum_f = sum(Eval_df["forecast"])
+base_adj = "base" if(sum(Eval_df["forecast"]) == sum(Eval_df["base_forecast"])) else "adjusted"
+
+
+Metrics_df = pd.DataFrame({"ctry_inch":['Total Mkt'],
+                           "mape":[round(mape*100,2)],
+                           "wmape":[round(wmape*100,2)],
+                           "total_GFK Monthly Sell Out Qty_sum": [GFK_Monthly_Sell_Out_Qty_sum_r],
+                           "total_forecast": [GFK_Monthly_Sell_Out_Qty_sum_f],
+                           "base/adjusted": [base_adj]})
+
+# By ctry_inch adjusted
+for c_i in cy_in:
+    t_df = Eval_df.loc[Eval_df["ctry_inch"] == c_i].copy()
+
+    wmape = sum(abs(t_df["GFK Monthly Sell Out Qty_sum"] - t_df["forecast"])) / sum(abs(t_df["GFK Monthly Sell Out Qty_sum"]))
+    mape = ((t_df["GFK Monthly Sell Out Qty_sum"] - t_df["forecast"]).abs() / t_df["GFK Monthly Sell Out Qty_sum"]).mean()
+
+    GFK_Monthly_Sell_Out_Qty_sum_r = sum(t_df["GFK Monthly Sell Out Qty_sum"])
+    GFK_Monthly_Sell_Out_Qty_sum_f = sum(t_df["forecast"])
+    base_adj = "base" if(sum(t_df["forecast"]) == sum(t_df["base_forecast"])) else "adjusted"
+
+    Metrics_df = Metrics_df.append(pd.DataFrame({"ctry_inch":[c_i],
+                                                 "mape":[round(mape*100,2)],
+                                                 "wmape":[round(wmape*100,2)],
+                                                 "total_GFK Monthly Sell Out Qty_sum": [GFK_Monthly_Sell_Out_Qty_sum_r],
+                                                 "total_forecast": [GFK_Monthly_Sell_Out_Qty_sum_f],
+                                                 "base/adjusted": [base_adj]
+                                                }), ignore_index=True)
+
+Metrics_df = Metrics_df[["ctry_inch","mape","wmape","total_GFK Monthly Sell Out Qty_sum","total_forecast", "base/adjusted"]]
+
+
+# Write recipe outputs
+Mkt_MonthlyData_Yearly_Eval = dataiku.Dataset("Segment_MonthlyData_Yearly-Eval")
+Mkt_MonthlyData_Yearly_Eval.write_with_schema(Eval_df)
+Mkt_MonthlyData_Yearly_Metrics = dataiku.Dataset("Segment_MonthlyData_Yearly-Metrics")
+Mkt_MonthlyData_Yearly_Metrics.write_with_schema(Metrics_df)
+
+
+
